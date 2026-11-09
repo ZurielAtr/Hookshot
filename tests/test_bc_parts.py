@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def check_source():
     """The upload still takes its runs from bc_parts.h, and the next recordings still continue what it left"""
     tex = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8")
-    for needle in ('#include "bc_parts.h"', "bc_parts::run_end(", "bc_parts::run_fits(", 'getenv("RX_VK_BC_PART_MTEXELS")',
+    for needle in ('#include "bc_parts.h"', "bc_parts::run_end(", "bc_parts::fit_layers(", 'getenv("RX_VK_BC_PART_MTEXELS")',
                    "void texture_bc_continue()", "bc_part_texels = 0;"):
         if needle not in tex:
             raise SystemExit("vk_texture.cpp no longer has: " + needle)
@@ -19,6 +19,13 @@ def check_source():
                    "vkCmdCopyImage(cmd, tex.image, VK_IMAGE_LAYOUT_GENERAL, tex.image, VK_IMAGE_LAYOUT_GENERAL"):
         if needle not in tex:
             raise SystemExit("vk_texture.cpp no longer fills a new image's deferred BC3 layers: " + needle)
+    # (only the layers this recording takes are staged: the split is decided before the copy into staging)
+    up = tex[tex.index("bool upload_astc_gpu("):]
+    up = up[:up.index("st_astc++;")]   # (its BC3 path)
+    if up.index("bc_parts::fit_layers(") > up.index("staging(tail * layers.size()"):
+        raise SystemExit("upload_astc_gpu stages BC3 layers before deciding which ones this recording takes")
+    if "bc_parts::run_fits(" in up:
+        raise SystemExit("upload_astc_gpu checks the budget inside the encode loop again (layers staged and not encoded)")
     # (a continuation that could not record goes back on the list, and is not logged as finished)
     cont = tex[tex.index("void texture_bc_continue()"):tex.index("bool texture_bc_pending()")]
     if "const bool ok = upload_astc_gpu(" not in cont or "bc_parts::retry_continue(" not in cont:

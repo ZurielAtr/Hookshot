@@ -19,6 +19,20 @@ inline bool run_fits(uint64_t used, uint64_t run, uint64_t budget, bool first) {
     return !budget || first || used + run <= budget;
 }
 
+/// How many of `layers`, from the first, a recording whose upload holds `used` texels already takes: whole runs (run_end) while
+/// they fit (run_fits: the first always). Only those are staged; the rest waits for the next recordings with nothing copied
+inline size_t fit_layers(const uint32_t* layers, size_t n, size_t max_run, uint64_t layer_texels, uint64_t used, uint64_t budget) {
+    size_t r0 = 0;
+    while (r0 < n) {
+        const size_t r1 = run_end(layers, n, r0, max_run);
+        const uint64_t run = layer_texels * (r1 - r0);
+        if (!run_fits(used, run, budget, r0 == 0)) break;
+        used += run;
+        r0 = r1;
+    }
+    return r0;
+}
+
 /// A new image's deferred layers are filled, until their own are in, from the last layer this upload encoded (layers[r0 - 1]):
 /// left as they were they showed whatever the image's memory held before, other textures' BC3 blocks from the image pool
 /// (opaque black, purple, yellow squares in the sky). ~0u: nothing encoded yet, nothing to fill from

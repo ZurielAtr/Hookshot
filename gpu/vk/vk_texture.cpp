@@ -787,6 +787,29 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
         if (overlaps(dirty, (uint64_t)layer * layer_size + tail0, (uint64_t)(layer + 1) * layer_size)) layers.push_back(layer);
     if (layers.empty()) return true;
     const bool all = layers.size() == tex.layers;
+    // (hookshot-amd) a BC3 texture: only the runs of layers this recording takes are staged (bc_parts::fit_layers); the rest
+    // waits on bc_pending with nothing copied. Every layer still to come was staged at each continuation: ~56 MB copied from
+    // guest memory to encode 2 or 3 of a 1365 x 1365 x 90 array's layers, ~0.9 GB per array over its recordings, and a
+    // 10.7 s frame on an RX 7700S when Hyrule Field's two arrays were made again (staging arenas up to 32 x 64 MB)
+    // (one layer a run: with runs of up to kBcLayers, an array's layers past the run's first came out wrong in the
+    // smaller levels, and Hyrule Field's ground, which samples the terrain's material arrays (1365 x 1365 x 90, ASTC
+    // 8x8) at those levels from a distance, had its tiles outlined in dark lines (RX 6600: none with one layer a run,
+    // nor with the arrays kept as RGBA8). RX_VK_BC_LAYERS=<n>: up to n a run)
+    static const uint32_t bc_run = getenv("RX_VK_BC_LAYERS") ? std::clamp<uint32_t>((uint32_t)atoi(getenv("RX_VK_BC_LAYERS")), 1u, kBcLayers) : 1u;
+    uint64_t layer_texels = 0;   // (decoded at the game's size and encoded at the image's)
+    std::vector<uint32_t> rest;  // (the BC3 layers left for the next recordings)
+    if (tex.bc) {
+        for (uint32_t level = 0; level < tex.levels; level++) {
+            const LevelGeo g = level_geo(tex, level);
+            layer_texels += (uint64_t)g.w * g.h + (uint64_t)std::max(1u, tex.width >> level) * std::max(1u, tex.height >> level);
+        }
+        // (never on a parallel replay's segment worker: bc_pending is the replay thread's, and a later recording of
+        // another segment can come before this image's first layout change in queue order: see seg_init above)
+        const uint64_t budget = tl_seg_index >= 0 ? 0 : bc_part_budget();
+        const size_t take = bc_parts::fit_layers(layers.data(), layers.size(), bc_run, layer_texels, bc_part_texels, budget);
+        rest.assign(layers.begin() + (long)take, layers.end());
+        layers.resize(take);
+    }
     const Staging s = staging(tail * layers.size(), std::max<uint64_t>(256, dev.props.limits.minStorageBufferOffsetAlignment));
     if (!s.buffer) return false;
     std::vector<uint8_t> scratch;
@@ -803,57 +826,10 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 4);
     if (tex.bc) {   // (decoded into the scratch a run of consecutive layers at a time, re-encoded, copied in)
         if (!bc_scratch_layout(cmd, tex.bc_resized)) return false;
-        // (runs of layers, each with all its levels, while this recording's share lasts: see bc_pending)
-        uint64_t layer_texels = 0;   // (decoded at the game's size and encoded at the image's)
-        for (uint32_t level = 0; level < tex.levels; level++) {
-            const LevelGeo g = level_geo(tex, level);
-            layer_texels += (uint64_t)g.w * g.h + (uint64_t)std::max(1u, tex.width >> level) * std::max(1u, tex.height >> level);
-        }
-        // (one layer a run: with runs of up to kBcLayers, an array's layers past the run's first came out wrong in the
-        // smaller levels, and Hyrule Field's ground, which samples the terrain's material arrays (1365 x 1365 x 90, ASTC
-        // 8x8) at those levels from a distance, had its tiles outlined in dark lines (RX 6600: none with one layer a run,
-        // nor with the arrays kept as RGBA8). RX_VK_BC_LAYERS=<n>: up to n a run)
-        static const uint32_t run = getenv("RX_VK_BC_LAYERS") ? std::clamp<uint32_t>((uint32_t)atoi(getenv("RX_VK_BC_LAYERS")), 1u, kBcLayers) : 1u;
+        // (runs of layers, each with all its levels: the ones this recording takes, staged above; the rest below)
         for (size_t r0 = 0; r0 < layers.size();) {
-            const size_t r1 = bc_parts::run_end(layers.data(), layers.size(), r0, run);
-            const uint64_t run_texels = layer_texels * (r1 - r0);
-            // (never on a parallel replay's segment worker: bc_pending is the replay thread's, and a later recording of
-            // another segment can come before this image's first layout change in queue order: see seg_init above)
-            const uint64_t budget = tl_seg_index >= 0 ? 0 : bc_part_budget();
-            if (!bc_parts::run_fits(bc_part_texels, run_texels, budget, r0 == 0)) {   // (the rest: the next recordings)
-                bc_pending.push_back({&tex, total, std::vector<uint32_t>(layers.begin() + (long)r0, layers.end())});
-                // (a new image: its deferred layers filled from the last one encoded, every level, a copy in VRAM with no
-                // decode or encode; see bc_parts::fill_source. A texture uploaded before keeps its old layers meanwhile)
-                const uint32_t src = bc_parts::fill_source(layers.data(), r0);
-                if (!tex.uploaded && src != ~0u) {
-                    std::vector<VkImageCopy> fill;
-                    fill.reserve((layers.size() - r0) * tex.levels);
-                    for (size_t k = r0; k < layers.size(); k++)
-                        for (uint32_t level = 0; level < tex.levels; level++) {
-                            VkImageCopy c{};
-                            c.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, src, 1};
-                            c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layers[k], 1};
-                            c.extent = {std::max(1u, tex.width >> level), std::max(1u, tex.height >> level), 1};
-                            fill.push_back(c);
-                        }
-                    full_barrier(cmd, "barrier (BC3 deferred layers filled)");
-                    vkCmdCopyImage(cmd, tex.image, VK_IMAGE_LAYOUT_GENERAL, tex.image, VK_IMAGE_LAYOUT_GENERAL,
-                                   (uint32_t)fill.size(), fill.data());
-                    full_barrier(cmd, "barrier (BC3 deferred layers filled)");
-                    static int64_t filled;
-                    if (filled++ < 20 || filled % 200 == 0)
-                        logf("vk: BC3 texture %#llx %ux%u x%u: its %zu deferred layers filled from layer %u until they are in "
-                             "(%lld so far)", (unsigned long long)tex.gpu, tex.width, tex.height, tex.layers,
-                             layers.size() - r0, src, (long long)filled);
-                }
-                static int64_t deferred;
-                if (deferred++ < 20 || deferred % 200 == 0)
-                    logf("vk: BC3 texture %#llx %ux%u x%u: %zu of %u layers left for the next recordings (%lld so far)",
-                         (unsigned long long)tex.gpu, tex.width, tex.height, tex.layers, layers.size() - r0, tex.layers,
-                         (long long)deferred);
-                break;
-            }
-            bc_part_texels += run_texels;
+            const size_t r1 = bc_parts::run_end(layers.data(), layers.size(), r0, bc_run);
+            bc_part_texels += layer_texels * (r1 - r0);
         for (uint32_t level = 0; level < tex.levels; level++) {
             const LevelGeo g = level_geo(tex, level);
             const uint64_t off = g.offset - tail0;
@@ -891,6 +867,38 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             }
         }
             r0 = r1;
+        }
+        if (!rest.empty()) {   // (the rest: the next recordings)
+            bc_pending.push_back({&tex, total, rest});
+            // (a new image: its deferred layers filled from the last one encoded, every level, a copy in VRAM with no
+            // decode or encode; see bc_parts::fill_source. A texture uploaded before keeps its old layers meanwhile)
+            const uint32_t src = bc_parts::fill_source(layers.data(), layers.size());
+            if (!tex.uploaded && src != ~0u) {
+                std::vector<VkImageCopy> fill;
+                fill.reserve(rest.size() * tex.levels);
+                for (const uint32_t layer : rest)
+                    for (uint32_t level = 0; level < tex.levels; level++) {
+                        VkImageCopy c{};
+                        c.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, src, 1};
+                        c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
+                        c.extent = {std::max(1u, tex.width >> level), std::max(1u, tex.height >> level), 1};
+                        fill.push_back(c);
+                    }
+                full_barrier(cmd, "barrier (BC3 deferred layers filled)");
+                vkCmdCopyImage(cmd, tex.image, VK_IMAGE_LAYOUT_GENERAL, tex.image, VK_IMAGE_LAYOUT_GENERAL,
+                               (uint32_t)fill.size(), fill.data());
+                full_barrier(cmd, "barrier (BC3 deferred layers filled)");
+                static int64_t filled;
+                if (filled++ < 20 || filled % 200 == 0)
+                    logf("vk: BC3 texture %#llx %ux%u x%u: its %zu deferred layers filled from layer %u until they are in "
+                         "(%lld so far)", (unsigned long long)tex.gpu, tex.width, tex.height, tex.layers, rest.size(), src,
+                         (long long)filled);
+            }
+            static int64_t deferred;
+            if (deferred++ < 20 || deferred % 200 == 0)
+                logf("vk: BC3 texture %#llx %ux%u x%u: %zu of %u layers left for the next recordings, %llu KB staged now "
+                     "(%lld so far)", (unsigned long long)tex.gpu, tex.width, tex.height, tex.layers, rest.size(), tex.layers,
+                     (unsigned long long)(staged >> 10), (long long)deferred);
         }
         st_astc++;
         return true;
